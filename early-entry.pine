@@ -1,0 +1,27 @@
+//@version=6
+indicator("Early Entry — Price Breakout", overlay=true, max_labels_count=500)
+
+emaLength = input.int(50, "Trend EMA Length", minval=1)
+useTrend = input.bool(true, "Use EMA Trend Filter")
+
+// EMA filters direction; entries do not require a crossover.
+trendEMA = ta.ema(close, emaLength)
+plot(useTrend ? trendEMA : na, "Trend EMA", color=color.orange, linewidth=2)
+
+breakUp = close > high[1] and close > open
+breakDown = close < low[1] and close < open
+newBreakUp = breakUp and not breakUp[1]
+newBreakDown = breakDown and not breakDown[1]
+
+// Confirm signals at candle close.
+buySignal = barstate.isconfirmed and newBreakUp and (not useTrend or close > trendEMA)
+sellSignal = barstate.isconfirmed and newBreakDown and (not useTrend or close < trendEMA)
+
+if buySignal
+    label.new(bar_index, low, text="BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.normal)
+
+if sellSignal
+    label.new(bar_index, high, text="SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.normal)
+
+alertcondition(buySignal, title="BUY Entry", message="BUY: {{ticker}} | {{interval}} | Close: {{close}}")
+alertcondition(sellSignal, title="SELL Entry", message="SELL: {{ticker}} | {{interval}} | Close: {{close}}")
