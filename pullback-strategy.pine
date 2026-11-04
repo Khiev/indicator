@@ -1,0 +1,113 @@
+//@version=6
+strategy("XAUUSD MTF Pullback — Risk Managed", overlay=true, initial_capital=10000, pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.05, slippage=2, margin_long=100, margin_short=100, max_labels_count=500)
+
+// Standard candles only. Market entries fill at the next available tick
+// (normally next bar open in historical tests). No intrabar recalculation.
+fastLen = input.int(20, "Pullback EMA", minval=1, group="Entry")
+trendLen = input.int(200, "Trend EMA", minval=2, group="Entry")
+pullbackBars = input.int(5, "Pullback window", minval=1, group="Entry")
+diLen = input.int(14, "DI length", minval=1, group="Entry")
+adxLen = input.int(14, "ADX smoothing", minval=1, group="Entry")
+minAdx = input.float(20, "Minimum ADX", minval=0, group="Entry")
+direction = input.string("Both", "Trade direction", options=["Both", "Long only", "Short only"], group="Entry")
+
+useHTF = input.bool(true, "Use confirmed higher timeframe trend", group="Filters")
+htfInput = input.timeframe("", "Higher timeframe (blank = automatic)", group="Filters")
+htf = htfInput == "" ? (timeframe.in_seconds() <= 300 ? "15" : "60") : htfInput
+useSession = input.bool(false, "Use trading session", group="Filters")
+sessionHours = input.session("0800-1700", "Session (exchange timezone)", group="Filters")
+cooldown = input.int(3, "Full bars to wait after exit", minval=0, group="Filters")
+
+riskPct = input.float(0.5, "Equity risk per trade (%)", minval=0.01, maxval=5, step=0.1, group="Risk")
+atrLen = input.int(14, "ATR length", minval=1, group="Risk")
+swingLen = input.int(5, "Stop swing lookback", minval=1, group="Risk")
+stopBuffer = input.float(0.2, "ATR buffer beyond swing", minval=0, step=0.1, group="Risk")
+minStopAtr = input.float(1, "Minimum stop distance (ATR)", minval=0.1, group="Risk")
+maxStopAtr = input.float(3, "Maximum stop distance (ATR)", minval=0.1, group="Risk")
+rewardR = input.float(2, "Profit target (R)", minval=0.1, step=0.1, group="Risk")
+qtyStep = input.float(0.01, "Quantity step (symbol units/contracts, NOT broker lots)", minval=0.00000001, group="Risk")
+maxExposure = input.float(100, "Maximum notional / equity (%)", minval=1, maxval=100, group="Risk")
+dailyLoss = input.float(2, "Intraday equity loss limit (%)", minval=0.1, maxval=20, group="Risk")
+maxEntries = input.int(3, "Maximum entry orders per day", minval=1, group="Risk")
+
+strategy.risk.max_intraday_loss(dailyLoss, strategy.percent_of_equity)
+
+if barstate.isfirst and useHTF and timeframe.in_seconds(htf) <= timeframe.in_seconds()
+    runtime.error("Choose a higher timeframe above the chart timeframe.")
+if barstate.isfirst and maxStopAtr < minStopAtr
+    runtime.error("Maximum stop ATR must be at least minimum stop ATR.")
+
+fast = ta.ema(close, fastLen)
+trend = ta.ema(close, trendLen)
+atr = ta.atr(atrLen)
+[plusDI, minusDI, adx] = ta.dmi(diLen, adxLen)
+// Offset plus lookahead_on uses only completed HTF candles.
+[htfClose, htfTrend] = request.security(syminfo.tickerid, htf, [close[1], ta.ema(close, trendLen)[1]], lookahead=barmerge.lookahead_on)
+
+inSession = not useSession or not na(time(timeframe.period, sessionHours))
+var int entriesToday = 0
+if timeframe.change("1D")
+    entriesToday := 0
+lastExit = strategy.closedtrades > 0 ? strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1) : na
+cooled = na(lastExit) or bar_index - lastExit > cooldown
+ready = barstate.isconfirmed and strategy.position_size == 0 and cooled and inSession and entriesToday < maxEntries and strategy.equity > 0
+
+// Look for a prior touch of the pullback EMA, then a price breakout.
+recentLongTouch = ta.lowest(low - fast, pullbackBars)[1] <= 0
+recentShortTouch = ta.highest(high - fast, pullbackBars)[1] >= 0
+longTrend = close > trend and fast > trend and trend > trend[3]
+shortTrend = close < trend and fast < trend and trend < trend[3]
+longTrigger = recentLongTouch and close > high[1] and close > open and close > fast
+shortTrigger = recentShortTouch and close < low[1] and close < open and close < fast
+longSetup = longTrend and longTrigger and adx >= minAdx and plusDI > minusDI and (not useHTF or htfClose > htfTrend)
+shortSetup = shortTrend and shortTrigger and adx >= minAdx and minusDI > plusDI and (not useHTF or htfClose < htfTrend)
+
+longDistance = math.max(close - (ta.lowest(low, swingLen) - atr * stopBuffer), atr * minStopAtr)
+shortDistance = math.max((ta.highest(high, swingLen) + atr * stopBuffer) - close, atr * minStopAtr)
+
+// Convert symbol-currency P/L into strategy account currency.
+positionQty(float distance) =>
+    unitRisk = strategy.convert_to_account(distance * syminfo.pointvalue)
+    unitValue = strategy.convert_to_account(close * syminfo.pointvalue)
+    riskCash = strategy.equity * riskPct / 100
+    capCash = strategy.equity * maxExposure / 100
+    rawQty = unitRisk > 0 and unitValue > 0 ? math.min(riskCash / unitRisk, capCash / unitValue) : 0.0
+    math.floor(rawQty / qtyStep) * qtyStep
+
+var int stopTicks = na
+var int targetTicks = na
+bool buyOrder = false
+bool sellOrder = false
+if ready
+    isLong = longSetup and direction != "Short only"
+    isShort = shortSetup and direction != "Long only"
+    if isLong or isShort
+        distance = isLong ? longDistance : shortDistance
+        ticks = int(math.ceil(distance / syminfo.mintick))
+        roundedDistance = ticks * syminfo.mintick
+        qty = positionQty(roundedDistance)
+        if roundedDistance <= atr * maxStopAtr and qty > 0
+            stopTicks := ticks
+            targetTicks := math.max(1, int(math.round(ticks * rewardR)))
+            if isLong
+                strategy.entry("Long", strategy.long, qty=qty, alert_message="BUY order filled")
+                strategy.exit("Long exit", "Long", loss=stopTicks, profit=targetTicks, alert_message="Long stop or target filled")
+                buyOrder := true
+            else
+                strategy.entry("Short", strategy.short, qty=qty, alert_message="SELL order filled")
+                strategy.exit("Short exit", "Short", loss=stopTicks, profit=targetTicks, alert_message="Short stop or target filled")
+                sellOrder := true
+            entriesToday += 1
+
+// Relative tick exits anchor to the actual simulated fill, not signal close.
+side = strategy.position_size > 0 ? 1 : -1
+activeStop = strategy.position_size != 0 ? strategy.position_avg_price - side * stopTicks * syminfo.mintick : na
+activeTarget = strategy.position_size != 0 ? strategy.position_avg_price + side * targetTicks * syminfo.mintick : na
+plot(fast, "Pullback EMA", color=color.aqua)
+plot(trend, "Trend EMA", color=color.orange, linewidth=2)
+plot(activeStop, "Stop", color=color.red, style=plot.style_linebr)
+plot(activeTarget, "Target", color=color.lime, style=plot.style_linebr)
+if buyOrder
+    label.new(bar_index, low, "BUY", yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white)
+if sellOrder
+    label.new(bar_index, high, "SELL", yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white)
